@@ -1,6 +1,6 @@
 """
-🍳 レシピ帳 — URLからNotionに自動保存
-対応: クックパッド / Kurashiru / デリッシュキッチン / Allrecipes / YouTube 他
+🍳 レシピ帳 — URLまたはテキストからNotionに自動保存
+対応: クックパッド / Kurashiru / デリッシュキッチン / Allrecipes / YouTube / Instagram（テキスト貼り付け）他
 """
 
 import streamlit as st
@@ -13,8 +13,9 @@ from urllib.parse import urlparse
 # ─────────────────────────────────────────────
 # 設定読み込み（Streamlit Cloud の Secrets から）
 # ─────────────────────────────────────────────
-NOTION_TOKEN = st.secrets.get("NOTION_TOKEN", "")
-NOTION_DB_ID = st.secrets.get("NOTION_DB_ID", "4d144a7a9484495abb8938cf193d7f5e")
+NOTION_TOKEN   = st.secrets.get("NOTION_TOKEN", "")
+NOTION_DB_ID   = st.secrets.get("NOTION_DB_ID", "4d144a7a9484495abb8938cf193d7f5e")
+ANTHROPIC_KEY  = st.secrets.get("ANTHROPIC_API_KEY", "")
 
 HEADERS = {
     "User-Agent": (
@@ -243,6 +244,66 @@ def extract_fallback(html: str, url: str) -> dict:
 
 
 # ─────────────────────────────────────────────
+# Claude API でテキストからレシピを抽出
+# ─────────────────────────────────────────────
+def extract_from_text_with_claude(raw_text: str, image_url: str = "") -> dict:
+    """
+    Instagramキャプション等の自由テキストをClaude APIで解析し
+    構造化されたレシピデータを返す。
+    """
+    import anthropic  # type: ignore
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+    prompt = f"""以下のテキストはInstagramやSNSに投稿されたレシピです。
+このテキストから以下の情報をJSON形式で抽出してください。
+
+抽出項目:
+- title: レシピ名（文中から推測、なければ「レシピ」）
+- servings: 何人分か（数字＋「人分」の形式。記載なければ空文字）
+- total_time: 調理時間（例: "20分"。記載なければ空文字）
+- calories: カロリー（例: "300kcal"。記載なければ空文字）
+- ingredients: 材料のリスト（各要素は「食材名 量」の文字列。最大30個）
+- instructions: 作り方のステップリスト（番号を除いた手順文。最大20ステップ）
+
+ルール:
+- 必ずJSONのみを返す（説明文は不要）
+- ingredientsとinstructionsは文字列の配列で返す
+- 情報がない項目は空文字または空配列にする
+
+テキスト:
+\"\"\"
+{raw_text[:3000]}
+\"\"\"
+"""
+
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = message.content[0].text.strip()
+    # コードブロックを除去
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    parsed = json.loads(raw)
+
+    return {
+        "title":        parsed.get("title", "レシピ") or "レシピ",
+        "description":  "",
+        "servings":     parsed.get("servings", ""),
+        "total_time":   parsed.get("total_time", ""),
+        "calories":     parsed.get("calories", ""),
+        "image_url":    image_url,
+        "ingredients":  parsed.get("ingredients", []),
+        "instructions": parsed.get("instructions", []),
+        "source_tag":   "その他",
+    }
+
+
+# ─────────────────────────────────────────────
 # サイト判定でソースタグを付与
 # ─────────────────────────────────────────────
 def detect_source_tag(url: str) -> str:
@@ -331,64 +392,133 @@ def save_to_notion(recipe: dict, source_url: str) -> str:
 st.set_page_config(page_title="🍳 レシピ帳", page_icon="🍳", layout="wide")
 
 st.title("🍳 レシピ帳")
-st.caption("URLを貼るだけで材料・作り方をNotionに自動保存")
+st.caption("URLを貼るか、InstagramのキャプションをコピペするだけでNotionに自動保存")
 
-# Notionトークン未設定の場合は警告
+# ─── Notionトークン未設定チェック ───
 if not NOTION_TOKEN:
     st.error(
         "⚠️ Notionトークンが設定されていません。\n\n"
         "Streamlit Cloud の Settings → Secrets に以下を追加してください：\n\n"
-        "```\nNOTION_TOKEN = \"secret_xxxx\"\n```"
+        "```toml\n"
+        "NOTION_TOKEN = \"ntn_xxxx\"\n"
+        "NOTION_DB_ID = \"4d144a7a9484495abb8938cf193d7f5e\"\n"
+        "ANTHROPIC_API_KEY = \"sk-ant-xxxx\"\n"
+        "```"
     )
     st.stop()
 
-# ─── URL入力 ───
-url_input = st.text_input(
-    "📎 レシピURLを貼り付け",
-    placeholder="https://cookpad.com/recipe/...  /  https://www.youtube.com/watch?v=...",
-)
-extract_btn = st.button("🔍 レシピを読み込む", type="primary", use_container_width=False)
+# ─────────────────────────────────────────────
+# タブ切り替え
+# ─────────────────────────────────────────────
+tab_url, tab_text = st.tabs(["🔗 URLから保存（レシピサイト・YouTube）", "📸 テキストから保存（Instagram・手動）"])
 
-# ─── 抽出 ───
-if extract_btn and url_input:
-    if "instagram.com" in url_input:
-        st.error("Instagramはログイン必須のため自動抽出できません。")
-    else:
-        with st.spinner("読み込み中..."):
-            is_yt = "youtube.com" in url_input or "youtu.be" in url_input
-            recipe = None
 
-            if is_yt:
-                recipe = extract_youtube(url_input)
-            else:
-                html = fetch_page(url_input)
-                if html:
-                    recipe = extract_schema_recipe(html)
-                    if not recipe:
-                        st.info("構造化データなし → HTML汎用解析で試みます")
-                        recipe = extract_fallback(html, url_input)
+# ══════════════════════════════════════════════
+# TAB 1 : URLモード（既存機能）
+# ══════════════════════════════════════════════
+with tab_url:
+    url_input = st.text_input(
+        "📎 レシピURLを貼り付け",
+        placeholder="https://cookpad.com/recipe/...  /  https://www.youtube.com/watch?v=...",
+        key="url_input",
+    )
+    extract_btn = st.button("🔍 レシピを読み込む", type="primary", key="btn_url")
 
-            if recipe:
-                st.session_state["recipe"] = recipe
-                st.session_state["url"] = url_input
+    if extract_btn and url_input:
+        if "instagram.com" in url_input:
+            st.warning("Instagramは「テキストから保存」タブをご利用ください 👉")
+        else:
+            with st.spinner("読み込み中..."):
+                is_yt = "youtube.com" in url_input or "youtu.be" in url_input
+                recipe = None
+                if is_yt:
+                    recipe = extract_youtube(url_input)
+                else:
+                    html = fetch_page(url_input)
+                    if html:
+                        recipe = extract_schema_recipe(html)
+                        if not recipe:
+                            st.info("構造化データなし → HTML汎用解析で試みます")
+                            recipe = extract_fallback(html, url_input)
+                if recipe:
+                    st.session_state["recipe"] = recipe
+                    st.session_state["source_url"] = url_input
 
-# ─── プレビュー & 保存 ───
+
+# ══════════════════════════════════════════════
+# TAB 2 : テキスト貼り付けモード（Instagram等）
+# ══════════════════════════════════════════════
+with tab_text:
+    st.markdown("""
+    **Instagramの使い方（3ステップ）**
+    1. Instagramでレシピ投稿を開く
+    2. キャプション（文章部分）を**長押し → 全選択 → コピー**
+    3. 下のボックスに貼り付けて「解析する」を押す
+    """)
+
+    col_img, col_paste = st.columns([1, 2])
+
+    with col_img:
+        image_url_input = st.text_input(
+            "🖼️ 画像URLを貼り付け（任意）",
+            placeholder="https://...jpg",
+            key="text_image_url",
+            help="Notionのカバー画像に使います。なくてもOK。",
+        )
+
+    with col_paste:
+        pasted_text = st.text_area(
+            "📋 レシピテキストを貼り付け",
+            height=200,
+            placeholder="例）\n材料（2人分）\n鶏もも肉 300g\n醤油 大さじ2\n...\n\n作り方\n①鶏肉を一口大に切る\n②フライパンで焼く...",
+            key="pasted_text",
+        )
+
+    parse_btn = st.button("✨ AIで解析する", type="primary", key="btn_text")
+
+    if parse_btn:
+        if not pasted_text.strip():
+            st.warning("テキストを貼り付けてください。")
+        elif not ANTHROPIC_KEY:
+            st.error(
+                "⚠️ ANTHROPIC_API_KEY が設定されていません。\n\n"
+                "Streamlit Cloud の Secrets に `ANTHROPIC_API_KEY = \"sk-ant-xxxx\"` を追加してください。"
+            )
+        else:
+            with st.spinner("Claude AIで解析中..."):
+                try:
+                    recipe = extract_from_text_with_claude(
+                        pasted_text, image_url=image_url_input.strip()
+                    )
+                    recipe["source_tag"] = "その他"
+                    st.session_state["recipe"] = recipe
+                    st.session_state["source_url"] = image_url_input.strip() or ""
+                    st.success("✅ 解析完了！下のプレビューを確認してください。")
+                except json.JSONDecodeError:
+                    st.error("JSONの解析に失敗しました。もう一度試してください。")
+                except Exception as e:
+                    st.error(f"解析エラー: {e}")
+
+
+# ══════════════════════════════════════════════
+# 共通：プレビュー & Notion保存
+# ══════════════════════════════════════════════
 if "recipe" in st.session_state:
     recipe = st.session_state["recipe"]
-    source_url = st.session_state.get("url", "")
+    source_url = st.session_state.get("source_url", "")
 
     st.divider()
-    st.subheader("📋 プレビュー")
+    st.subheader("📋 プレビュー（編集してから保存できます）")
 
     col_l, col_r = st.columns([3, 2])
     with col_l:
-        recipe["title"] = st.text_input("レシピ名（編集可）", value=recipe.get("title", ""))
+        recipe["title"] = st.text_input("レシピ名", value=recipe.get("title", ""), key="preview_title")
 
         if recipe.get("description"):
             st.caption(recipe["description"][:200])
 
         m1, m2, m3 = st.columns(3)
-        if recipe.get("servings"):    m1.metric("人数", recipe["servings"])
+        if recipe.get("servings"):   m1.metric("人数", recipe["servings"])
         if recipe.get("total_time"): m2.metric("調理時間", recipe["total_time"])
         if recipe.get("calories"):   m3.metric("カロリー", recipe["calories"])
 
@@ -397,14 +527,14 @@ if "recipe" in st.session_state:
             for ing in recipe["ingredients"]:
                 st.markdown(f"- {ing}")
         else:
-            st.caption("材料を自動抽出できませんでした")
+            st.caption("材料を抽出できませんでした")
 
         st.markdown("##### 👨‍🍳 作り方")
         if recipe.get("instructions"):
             for i, step in enumerate(recipe["instructions"], 1):
                 st.markdown(f"**{i}.** {step}")
         else:
-            st.caption("作り方を自動抽出できませんでした")
+            st.caption("作り方を抽出できませんでした")
 
     with col_r:
         if recipe.get("image_url"):
