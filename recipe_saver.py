@@ -330,7 +330,7 @@ def save_to_notion(recipe: dict, source_url: str) -> str:
     properties = {
         "レシピ名": {"title": [{"text": {"content": recipe["title"][:100]}}]},
         "ソース": {"select": {"name": source_tag}},
-        "URL": {"url": source_url},
+        "URL": {"url": source_url if source_url else None},
     }
     if recipe.get("servings"):
         properties["人数"] = {"rich_text": [{"text": {"content": recipe["servings"][:50]}}]}
