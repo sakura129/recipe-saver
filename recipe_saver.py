@@ -304,6 +304,29 @@ def extract_from_text_with_claude(raw_text: str, image_url: str = "") -> dict:
 
 
 # ─────────────────────────────────────────────
+# 画像を Telegraph（無料）にアップロードしてURLを返す
+# ─────────────────────────────────────────────
+def upload_image_telegraph(image_bytes: bytes, filename: str = "image.jpg") -> str:
+    """
+    Telegram の Telegraph サービスに画像をアップロードし公開URLを返す。
+    API キー不要・無料・永続。
+    """
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "jpg"
+    content_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+    resp = requests.post(
+        "https://telegra.ph/upload",
+        files={"file": (filename, image_bytes, content_type)},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list) and data:
+        return "https://telegra.ph" + data[0]["src"]
+    raise Exception(f"画像アップロード失敗: {data}")
+
+
+# ─────────────────────────────────────────────
 # サイト判定でソースタグを付与
 # ─────────────────────────────────────────────
 def detect_source_tag(url: str) -> str:
@@ -312,6 +335,7 @@ def detect_source_tag(url: str) -> str:
     if "kurashiru.com" in u:      return "Kurashiru"
     if "delishkitchen.tv" in u:   return "デリッシュキッチン"
     if "allrecipes.com" in u:     return "Allrecipes"
+    if "instagram.com" in u:      return "Instagram"
     if "youtube.com" in u or "youtu.be" in u: return "YouTube"
     return "その他"
 
@@ -324,7 +348,8 @@ def save_to_notion(recipe: dict, source_url: str) -> str:
     from notion_client import Client  # type: ignore
 
     notion = Client(auth=NOTION_TOKEN)
-    source_tag = detect_source_tag(source_url)
+    # recipe に source_tag が明示されていればそれを優先（Instagramテキストモード等）
+    source_tag = recipe.get("source_tag") or detect_source_tag(source_url)
 
     # プロパティ
     properties = {
@@ -456,20 +481,30 @@ with tab_text:
     3. 下のボックスに貼り付けて「解析する」を押す
     """)
 
+    # ── Instagram URL ──
+    instagram_url = st.text_input(
+        "🔗 InstagramのURL（任意）",
+        placeholder="https://www.instagram.com/p/xxxxx/ または reel/xxxxx/",
+        key="instagram_url",
+        help="Notionのプロパティに保存されます。なくてもOK。",
+    )
+
     col_img, col_paste = st.columns([1, 2])
 
     with col_img:
-        image_url_input = st.text_input(
-            "🖼️ 画像URLを貼り付け（任意）",
-            placeholder="https://...jpg",
-            key="text_image_url",
-            help="Notionのカバー画像に使います。なくてもOK。",
+        uploaded_file = st.file_uploader(
+            "🖼️ 画像をアップロード（任意）",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="uploaded_image",
+            help="スマホのカメラロールからも選べます。Notionのカバー画像になります。",
         )
+        if uploaded_file:
+            st.image(uploaded_file, use_container_width=True)
 
     with col_paste:
         pasted_text = st.text_area(
             "📋 レシピテキストを貼り付け",
-            height=200,
+            height=220,
             placeholder="例）\n材料（2人分）\n鶏もも肉 300g\n醤油 大さじ2\n...\n\n作り方\n①鶏肉を一口大に切る\n②フライパンで焼く...",
             key="pasted_text",
         )
@@ -487,12 +522,19 @@ with tab_text:
         else:
             with st.spinner("Claude AIで解析中..."):
                 try:
-                    recipe = extract_from_text_with_claude(
-                        pasted_text, image_url=image_url_input.strip()
-                    )
-                    recipe["source_tag"] = "その他"
+                    recipe = extract_from_text_with_claude(pasted_text)
+                    recipe["source_tag"] = "Instagram"
+
+                    # アップロード済み画像をセッションに保持
+                    if uploaded_file:
+                        st.session_state["uploaded_image_bytes"] = uploaded_file.read()
+                        st.session_state["uploaded_image_name"] = uploaded_file.name
+                    else:
+                        st.session_state.pop("uploaded_image_bytes", None)
+                        st.session_state.pop("uploaded_image_name", None)
+
                     st.session_state["recipe"] = recipe
-                    st.session_state["source_url"] = image_url_input.strip() or ""
+                    st.session_state["source_url"] = instagram_url.strip()
                     st.success("✅ 解析完了！下のプレビューを確認してください。")
                 except json.JSONDecodeError:
                     st.error("JSONの解析に失敗しました。もう一度試してください。")
@@ -549,10 +591,22 @@ if "recipe" in st.session_state:
         if st.button("📝 Notionに保存する", type="primary", use_container_width=True):
             with st.spinner("Notionに保存中..."):
                 try:
+                    # アップロード画像がある場合は Telegraph に送って URL を取得
+                    img_bytes = st.session_state.get("uploaded_image_bytes")
+                    if img_bytes:
+                        with st.spinner("画像をアップロード中..."):
+                            try:
+                                img_name = st.session_state.get("uploaded_image_name", "image.jpg")
+                                recipe["image_url"] = upload_image_telegraph(img_bytes, img_name)
+                            except Exception as e:
+                                st.warning(f"画像アップロード失敗（スキップして続行）: {e}")
+
                     page_url = save_to_notion(recipe, source_url)
                     st.success("✅ Notionに保存しました！")
                     st.markdown(f"[📖 Notionで開く]({page_url})")
                     st.balloons()
+                    # 保存後は画像バイトを解放
+                    st.session_state.pop("uploaded_image_bytes", None)
                 except Exception as e:
                     st.error(f"保存エラー: {e}")
     with col_clear:
