@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 NOTION_TOKEN   = st.secrets.get("NOTION_TOKEN", "")
 NOTION_DB_ID   = st.secrets.get("NOTION_DB_ID", "4d144a7a9484495abb8938cf193d7f5e")
 ANTHROPIC_KEY  = st.secrets.get("ANTHROPIC_API_KEY", "")
+NOTION_VERSION = "2022-06-28"
 
 HEADERS = {
     "User-Agent": (
@@ -304,26 +305,51 @@ def extract_from_text_with_claude(raw_text: str, image_url: str = "") -> dict:
 
 
 # ─────────────────────────────────────────────
-# 画像を Telegraph（無料）にアップロードしてURLを返す
+# 画像をNotion公式 File Upload APIでアップロード
 # ─────────────────────────────────────────────
-def upload_image_telegraph(image_bytes: bytes, filename: str = "image.jpg") -> str:
+def upload_image_to_notion(image_bytes: bytes, filename: str = "image.jpg") -> str | None:
     """
-    Telegram の Telegraph サービスに画像をアップロードし公開URLを返す。
-    API キー不要・無料・永続。
+    Notion公式の File Upload API を使って画像をアップロードし、
+    file_upload オブジェクトの ID を返す。
+    （外部の画像ホスティングサービスを使わないため、Notion側での
+      画像表示エラーが発生しない）
+    失敗した場合は None を返す。
     """
-    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "jpg"
-    content_type = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
-    resp = requests.post(
-        "https://telegra.ph/upload",
-        files={"file": (filename, image_bytes, content_type)},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, list) and data:
-        return "https://telegra.ph" + data[0]["src"]
-    raise Exception(f"画像アップロード失敗: {data}")
+    ext = (filename.rsplit(".", 1)[-1] if "." in filename else "jpg").lower()
+    ct = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+          "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+    }
+
+    try:
+        # 1. アップロード用オブジェクトを作成
+        create_resp = requests.post(
+            "https://api.notion.com/v1/file_uploads",
+            headers={**headers, "Content-Type": "application/json"},
+            json={},
+            timeout=15,
+        )
+        create_resp.raise_for_status()
+        upload_info = create_resp.json()
+        upload_id = upload_info["id"]
+        upload_url = upload_info["upload_url"]
+
+        # 2. ファイル本体を送信
+        send_resp = requests.post(
+            upload_url,
+            headers=headers,
+            files={"file": (filename, image_bytes, ct)},
+            timeout=30,
+        )
+        send_resp.raise_for_status()
+
+        return upload_id
+    except Exception as e:
+        st.warning(f"画像のNotionアップロードに失敗しました: {e}")
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -367,6 +393,13 @@ def save_to_notion(recipe: dict, source_url: str) -> str:
     # ページ本文ブロック
     children = []
 
+    # Notionにアップロードした画像を本文の先頭に埋め込む
+    if recipe.get("image_file_upload_id"):
+        children.append({
+            "object": "block", "type": "image",
+            "image": {"type": "file_upload", "file_upload": {"id": recipe["image_file_upload_id"]}},
+        })
+
     if recipe.get("description"):
         children.append({
             "object": "block", "type": "quote",
@@ -397,9 +430,11 @@ def save_to_notion(recipe: dict, source_url: str) -> str:
                 "numbered_list_item": {"rich_text": [{"text": {"content": str(step)[:2000]}}]},
             })
 
-    # カバー画像
+    # カバー画像（Notionアップロード画像があれば優先、なければ外部URL）
     cover = None
-    if recipe.get("image_url"):
+    if recipe.get("image_file_upload_id"):
+        cover = {"type": "file_upload", "file_upload": {"id": recipe["image_file_upload_id"]}}
+    elif recipe.get("image_url"):
         cover = {"type": "external", "external": {"url": recipe["image_url"]}}
 
     page = notion.pages.create(
@@ -475,43 +510,34 @@ with tab_url:
 # ══════════════════════════════════════════════
 with tab_text:
     st.markdown("""
-    **Instagramの使い方（3ステップ）**
-    1. Instagramでレシピ投稿を開く
-    2. キャプション（文章部分）を**長押し → 全選択 → コピー**
-    3. 下のボックスに貼り付けて「解析する」を押す
+    **Instagramの使い方（かんたん2ステップ）**
+    1. Instagramの投稿で「⋯」→ リンクをコピー、キャプションは**長押し→全選択→コピー**して、まとめて下のボックスに貼り付け（URLと文章は同じ欄でOK）
+    2. 画像を選んで「✨ 解析してNotionに保存」を1回タップ
     """)
-
-    # ── Instagram URL ──
-    instagram_url = st.text_input(
-        "🔗 InstagramのURL（任意）",
-        placeholder="https://www.instagram.com/p/xxxxx/ または reel/xxxxx/",
-        key="instagram_url",
-        help="Notionのプロパティに保存されます。なくてもOK。",
-    )
 
     col_img, col_paste = st.columns([1, 2])
 
     with col_img:
         uploaded_file = st.file_uploader(
-            "🖼️ 画像をアップロード（任意）",
+            "🖼️ 画像（任意）",
             type=["jpg", "jpeg", "png", "webp"],
             key="uploaded_image",
-            help="スマホのカメラロールからも選べます。Notionのカバー画像になります。",
+            help="スマホのカメラロールから選べます。Notionのカバー画像＆本文に追加されます。",
         )
         if uploaded_file:
             st.image(uploaded_file, use_container_width=True)
 
     with col_paste:
         pasted_text = st.text_area(
-            "📋 レシピテキストを貼り付け",
+            "📋 InstagramのURL＋キャプションをまとめて貼り付け",
             height=220,
-            placeholder="例）\n材料（2人分）\n鶏もも肉 300g\n醤油 大さじ2\n...\n\n作り方\n①鶏肉を一口大に切る\n②フライパンで焼く...",
+            placeholder="https://www.instagram.com/p/xxxxx/\n\n材料（2人分）\n鶏もも肉 300g\n醤油 大さじ2\n...\n\n作り方\n①鶏肉を一口大に切る\n②フライパンで焼く...",
             key="pasted_text",
         )
 
-    parse_btn = st.button("✨ AIで解析する", type="primary", key="btn_text")
+    one_tap_btn = st.button("✨ 解析してNotionに保存", type="primary", key="btn_text", use_container_width=True)
 
-    if parse_btn:
+    if one_tap_btn:
         if not pasted_text.strip():
             st.warning("テキストを貼り付けてください。")
         elif not ANTHROPIC_KEY:
@@ -520,26 +546,49 @@ with tab_text:
                 "Streamlit Cloud の Secrets に `ANTHROPIC_API_KEY = \"sk-ant-xxxx\"` を追加してください。"
             )
         else:
-            with st.spinner("Claude AIで解析中..."):
-                try:
-                    recipe = extract_from_text_with_claude(pasted_text)
+            # 貼り付けテキストからInstagramのURLを自動検出し、本文から取り除く
+            url_match = re.search(r"https?://(?:www\.)?instagram\.com/\S+", pasted_text)
+            instagram_url = ""
+            text_for_ai = pasted_text
+            if url_match:
+                instagram_url = url_match.group(0).rstrip(".,、。　 ")
+                text_for_ai = pasted_text.replace(url_match.group(0), "").strip()
+
+            try:
+                with st.spinner("① Claude AIでレシピを解析中..."):
+                    recipe = extract_from_text_with_claude(text_for_ai)
                     recipe["source_tag"] = "Instagram"
 
-                    # アップロード済み画像をセッションに保持
-                    if uploaded_file:
-                        st.session_state["uploaded_image_bytes"] = uploaded_file.read()
-                        st.session_state["uploaded_image_name"] = uploaded_file.name
-                    else:
-                        st.session_state.pop("uploaded_image_bytes", None)
-                        st.session_state.pop("uploaded_image_name", None)
+                if uploaded_file:
+                    with st.spinner("② 画像をNotionにアップロード中..."):
+                        upload_id = upload_image_to_notion(uploaded_file.getvalue(), uploaded_file.name)
+                        if upload_id:
+                            recipe["image_file_upload_id"] = upload_id
 
-                    st.session_state["recipe"] = recipe
-                    st.session_state["source_url"] = instagram_url.strip()
-                    st.success("✅ 解析完了！下のプレビューを確認してください。")
-                except json.JSONDecodeError:
-                    st.error("JSONの解析に失敗しました。もう一度試してください。")
-                except Exception as e:
-                    st.error(f"解析エラー: {e}")
+                with st.spinner("③ Notionに保存中..."):
+                    page_url = save_to_notion(recipe, instagram_url)
+
+                st.success("✅ Notionに保存しました！")
+                st.markdown(f"[📖 Notionで開く]({page_url})")
+                st.balloons()
+
+                with st.expander("📋 抽出された内容を確認（違っていたらNotion側で編集してください）"):
+                    st.markdown(f"**{recipe.get('title', '')}**")
+                    m1, m2, m3 = st.columns(3)
+                    if recipe.get("servings"):   m1.metric("人数", recipe["servings"])
+                    if recipe.get("total_time"): m2.metric("調理時間", recipe["total_time"])
+                    if recipe.get("calories"):   m3.metric("カロリー", recipe["calories"])
+                    st.markdown("##### 🥕 材料")
+                    for ing in recipe.get("ingredients", []):
+                        st.markdown(f"- {ing}")
+                    st.markdown("##### 👨‍🍳 作り方")
+                    for i, step in enumerate(recipe.get("instructions", []), 1):
+                        st.markdown(f"**{i}.** {step}")
+
+            except json.JSONDecodeError:
+                st.error("AIによる解析に失敗しました（JSON形式エラー）。もう一度試してください。")
+            except Exception as e:
+                st.error(f"エラー: {e}")
 
 
 # ══════════════════════════════════════════════
@@ -591,22 +640,10 @@ if "recipe" in st.session_state:
         if st.button("📝 Notionに保存する", type="primary", use_container_width=True):
             with st.spinner("Notionに保存中..."):
                 try:
-                    # アップロード画像がある場合は Telegraph に送って URL を取得
-                    img_bytes = st.session_state.get("uploaded_image_bytes")
-                    if img_bytes:
-                        with st.spinner("画像をアップロード中..."):
-                            try:
-                                img_name = st.session_state.get("uploaded_image_name", "image.jpg")
-                                recipe["image_url"] = upload_image_telegraph(img_bytes, img_name)
-                            except Exception as e:
-                                st.warning(f"画像アップロード失敗（スキップして続行）: {e}")
-
                     page_url = save_to_notion(recipe, source_url)
                     st.success("✅ Notionに保存しました！")
                     st.markdown(f"[📖 Notionで開く]({page_url})")
                     st.balloons()
-                    # 保存後は画像バイトを解放
-                    st.session_state.pop("uploaded_image_bytes", None)
                 except Exception as e:
                     st.error(f"保存エラー: {e}")
     with col_clear:
