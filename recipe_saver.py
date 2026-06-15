@@ -8,6 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 import json
 import re
+import base64
 from urllib.parse import urlparse
 
 # ─────────────────────────────────────────────
@@ -305,6 +306,81 @@ def extract_from_text_with_claude(raw_text: str, image_url: str = "") -> dict:
 
 
 # ─────────────────────────────────────────────
+# Claude Vision API で画像（写真・スクショ）からレシピを抽出
+# ─────────────────────────────────────────────
+def _media_type(filename: str) -> str:
+    ext = (filename.rsplit(".", 1)[-1] if "." in filename else "jpg").lower()
+    return {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+
+
+def extract_from_images_with_claude(images: list[tuple[bytes, str]]) -> dict:
+    """
+    Instagramのスクリーンショットや、料理写真・レシピカードの撮影画像から
+    Claude Vision APIで直接レシピ情報を抽出する（コピペ不要）。
+    images: [(画像バイト列, ファイル名), ...]　最大5枚まで使用
+    """
+    import anthropic  # type: ignore
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+    content: list[dict] = []
+    for img_bytes, filename in images[:5]:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": _media_type(filename),
+                "data": base64.b64encode(img_bytes).decode("utf-8"),
+            },
+        })
+
+    prompt = """この画像は料理レシピのスクリーンショットまたは写真です
+（Instagramの投稿、レシピサイトの画面、レシピカード、雑誌のページなど）。
+画像内の文字や写真の内容から、以下の情報をJSON形式で抽出してください。
+
+抽出項目:
+- title: レシピ名（写真の料理名から推測してもよい。なければ「レシピ」）
+- servings: 何人分か（例: "2人分"。記載なければ空文字）
+- total_time: 調理時間（例: "20分"。記載なければ空文字）
+- calories: カロリー（例: "300kcal"。記載なければ空文字）
+- ingredients: 材料のリスト（各要素は「食材名 量」の文字列。最大30個）
+- instructions: 作り方のステップリスト（番号を除いた手順文。最大20ステップ）
+
+ルール:
+- 必ずJSONのみを返す（説明文は不要）
+- ingredientsとinstructionsは文字列の配列で返す
+- 複数枚の画像がある場合はすべてを統合して1つのレシピとしてまとめる
+- 情報がない項目は空文字または空配列にする
+"""
+    content.append({"type": "text", "text": prompt})
+
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    raw = message.content[0].text.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    parsed = json.loads(raw)
+
+    return {
+        "title":        parsed.get("title", "レシピ") or "レシピ",
+        "description":  "",
+        "servings":     parsed.get("servings", ""),
+        "total_time":   parsed.get("total_time", ""),
+        "calories":     parsed.get("calories", ""),
+        "image_url":    "",
+        "ingredients":  parsed.get("ingredients", []),
+        "instructions": parsed.get("instructions", []),
+        "source_tag":   "Instagram",
+    }
+
+
+# ─────────────────────────────────────────────
 # 画像をNotion公式 File Upload APIでアップロード
 # ─────────────────────────────────────────────
 def upload_image_to_notion(image_bytes: bytes, filename: str = "image.jpg") -> str | None:
@@ -452,7 +528,7 @@ def save_to_notion(recipe: dict, source_url: str) -> str:
 st.set_page_config(page_title="🍳 レシピ帳", page_icon="🍳", layout="wide")
 
 st.title("🍳 レシピ帳")
-st.caption("URLを貼るか、InstagramのキャプションをコピペするだけでNotionに自動保存")
+st.caption("URLを貼る／写真をアップロード／テキストを貼るだけでNotionに自動保存")
 
 # ─── Notionトークン未設定チェック ───
 if not NOTION_TOKEN:
@@ -470,7 +546,11 @@ if not NOTION_TOKEN:
 # ─────────────────────────────────────────────
 # タブ切り替え
 # ─────────────────────────────────────────────
-tab_url, tab_text = st.tabs(["🔗 URLから保存（レシピサイト・YouTube）", "📸 テキストから保存（Instagram・手動）"])
+tab_url, tab_photo, tab_text = st.tabs([
+    "🔗 URLから保存（レシピサイト・YouTube）",
+    "📷 写真・スクショから保存（いちばん簡単）",
+    "📝 テキストから保存（手動貼り付け）",
+])
 
 
 # ══════════════════════════════════════════════
@@ -486,7 +566,7 @@ with tab_url:
 
     if extract_btn and url_input:
         if "instagram.com" in url_input:
-            st.warning("Instagramは「テキストから保存」タブをご利用ください 👉")
+            st.warning("Instagramはログインが必要なため、URLからの自動取得には対応していません。「📷 写真・スクショから保存」タブをご利用ください 👉")
         else:
             with st.spinner("読み込み中..."):
                 is_yt = "youtube.com" in url_input or "youtu.be" in url_input
@@ -506,13 +586,100 @@ with tab_url:
 
 
 # ══════════════════════════════════════════════
-# TAB 2 : テキスト貼り付けモード（Instagram等）
+# TAB 2 : 写真・スクリーンショットモード（コピペ不要・最速）
+# ══════════════════════════════════════════════
+with tab_photo:
+    st.markdown("""
+    **使い方（コピペ一切不要）**
+    1. Instagramの投稿画面をそのまま**スクリーンショット**（写真とキャプションが収まるように。長い場合は2〜3枚に分けてOK）
+       ※ 料理写真やレシピカード・雑誌のページを**撮影**してもOK
+    2. 下にアップロードして「✨ 解析してNotionに保存」を1回タップ
+
+    画像に写っている文字をAIがそのまま読み取るので、コピーや貼り付けは不要です。
+    """)
+
+    photo_files = st.file_uploader(
+        "🖼️ 画像をアップロード（複数選択可）",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="photo_uploads",
+        accept_multiple_files=True,
+        help="スマホのカメラロール・スクリーンショットから選べます。",
+    )
+    if photo_files:
+        cols = st.columns(min(len(photo_files), 4))
+        for i, f in enumerate(photo_files):
+            with cols[i % len(cols)]:
+                st.image(f, use_container_width=True)
+
+    with st.expander("🔗 元のURLを記録する（任意）"):
+        photo_source_url = st.text_input(
+            "Instagramなどの投稿URL",
+            key="photo_source_url",
+            placeholder="https://www.instagram.com/p/xxxxx/",
+        )
+
+    photo_btn = st.button("✨ 解析してNotionに保存", type="primary", key="btn_photo", use_container_width=True)
+
+    if photo_btn:
+        if not photo_files:
+            st.warning("画像をアップロードしてください。")
+        elif not ANTHROPIC_KEY:
+            st.error(
+                "⚠️ ANTHROPIC_API_KEY が設定されていません。\n\n"
+                "Streamlit Cloud の Secrets に `ANTHROPIC_API_KEY = \"sk-ant-xxxx\"` を追加してください。"
+            )
+        else:
+            try:
+                images = [(f.getvalue(), f.name) for f in photo_files]
+
+                with st.spinner("① Claude AIで画像を解析中..."):
+                    recipe = extract_from_images_with_claude(images)
+
+                src_url = st.session_state.get("photo_source_url", "").strip()
+                if src_url:
+                    recipe["source_tag"] = detect_source_tag(src_url)
+
+                with st.spinner("② 画像をNotionにアップロード中..."):
+                    upload_id = upload_image_to_notion(images[0][0], images[0][1])
+                    if upload_id:
+                        recipe["image_file_upload_id"] = upload_id
+
+                with st.spinner("③ Notionに保存中..."):
+                    page_url = save_to_notion(recipe, src_url)
+
+                st.success("✅ Notionに保存しました！")
+                st.markdown(f"[📖 Notionで開く]({page_url})")
+                st.balloons()
+
+                with st.expander("📋 抽出された内容を確認（違っていたらNotion側で編集してください）"):
+                    st.markdown(f"**{recipe.get('title', '')}**")
+                    m1, m2, m3 = st.columns(3)
+                    if recipe.get("servings"):   m1.metric("人数", recipe["servings"])
+                    if recipe.get("total_time"): m2.metric("調理時間", recipe["total_time"])
+                    if recipe.get("calories"):   m3.metric("カロリー", recipe["calories"])
+                    st.markdown("##### 🥕 材料")
+                    for ing in recipe.get("ingredients", []):
+                        st.markdown(f"- {ing}")
+                    st.markdown("##### 👨‍🍳 作り方")
+                    for i, step in enumerate(recipe.get("instructions", []), 1):
+                        st.markdown(f"**{i}.** {step}")
+
+            except json.JSONDecodeError:
+                st.error("AIによる解析に失敗しました（JSON形式エラー）。もう一度試してください。")
+            except Exception as e:
+                st.error(f"エラー: {e}")
+
+
+# ══════════════════════════════════════════════
+# TAB 3 : テキスト貼り付けモード（手動）
 # ══════════════════════════════════════════════
 with tab_text:
     st.markdown("""
-    **Instagramの使い方（かんたん2ステップ）**
-    1. Instagramの投稿で「⋯」→ リンクをコピー、キャプションは**長押し→全選択→コピー**して、まとめて下のボックスに貼り付け（URLと文章は同じ欄でOK）
+    **テキストを貼り付けて保存（写真がない場合・手動入力向け）**
+    1. キャプションや材料・作り方のテキストを下のボックスにまとめて貼り付け（InstagramのURLも一緒に貼ってOK）
     2. 画像を選んで「✨ 解析してNotionに保存」を1回タップ
+
+    💡 Instagramのスクショがある場合は「📷 写真・スクショから保存」タブの方が簡単です。
     """)
 
     col_img, col_paste = st.columns([1, 2])
