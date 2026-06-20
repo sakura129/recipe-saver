@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 NOTION_TOKEN   = st.secrets.get("NOTION_TOKEN", "")
 NOTION_DB_ID   = st.secrets.get("NOTION_DB_ID", "4d144a7a9484495abb8938cf193d7f5e")
 ANTHROPIC_KEY  = st.secrets.get("ANTHROPIC_API_KEY", "")
-NOTION_VERSION = "2022-06-28"
+NOTION_VERSION = "2026-03-11"
 
 HEADERS = {
     "User-Agent": (
@@ -401,22 +401,27 @@ def upload_image_to_notion(image_bytes: bytes, filename: str = "image.jpg") -> s
     }
 
     try:
-        # 1. アップロード用オブジェクトを作成
+        # 1. アップロード用オブジェクトを作成（filename と content_type を必ず含める）
         create_resp = requests.post(
             "https://api.notion.com/v1/file_uploads",
             headers={**headers, "Content-Type": "application/json"},
-            json={},
+            json={"filename": filename, "content_type": ct},
             timeout=15,
         )
         create_resp.raise_for_status()
         upload_info = create_resp.json()
-        upload_id = upload_info["id"]
-        upload_url = upload_info["upload_url"]
+        upload_id   = upload_info["id"]
+        upload_url  = upload_info["upload_url"]
 
-        # 2. ファイル本体を送信
+        # 2. ファイル本体を multipart/form-data で送信
+        #    ※ requests が files= を渡すと Content-Type ヘッダーを自動設定するため
+        #      Authorization と Notion-Version だけを明示する
         send_resp = requests.post(
             upload_url,
-            headers=headers,
+            headers={
+                "Authorization": f"Bearer {NOTION_TOKEN}",
+                "Notion-Version": NOTION_VERSION,
+            },
             files={"file": (filename, image_bytes, ct)},
             timeout=30,
         )
