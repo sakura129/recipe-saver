@@ -408,14 +408,22 @@ def upload_image_to_notion(image_bytes: bytes, filename: str = "image.jpg") -> s
             json={"filename": filename, "content_type": ct},
             timeout=15,
         )
-        create_resp.raise_for_status()
+        if not create_resp.ok:
+            try:
+                detail = create_resp.json()
+            except Exception:
+                detail = create_resp.text
+            st.warning(f"⚠️ 画像アップロード準備エラー [Step1 HTTP {create_resp.status_code}]: {detail}")
+            return None
+
         upload_info = create_resp.json()
-        upload_id   = upload_info["id"]
-        upload_url  = upload_info["upload_url"]
+        upload_id  = upload_info["id"]
+        # upload_url が返らない場合は ID から構築
+        upload_url = upload_info.get("upload_url") or \
+                     f"https://api.notion.com/v1/file_uploads/{upload_id}/send"
 
         # 2. ファイル本体を multipart/form-data で送信
-        #    ※ requests が files= を渡すと Content-Type ヘッダーを自動設定するため
-        #      Authorization と Notion-Version だけを明示する
+        #    requests の files= を使うと Content-Type: multipart/form-data が自動付与される
         send_resp = requests.post(
             upload_url,
             headers={
@@ -425,11 +433,18 @@ def upload_image_to_notion(image_bytes: bytes, filename: str = "image.jpg") -> s
             files={"file": (filename, image_bytes, ct)},
             timeout=30,
         )
-        send_resp.raise_for_status()
+        if not send_resp.ok:
+            try:
+                detail = send_resp.json()
+            except Exception:
+                detail = send_resp.text
+            st.warning(f"⚠️ 画像アップロード送信エラー [Step2 HTTP {send_resp.status_code}]: {detail}")
+            return None
 
         return upload_id
+
     except Exception as e:
-        st.warning(f"画像のNotionアップロードに失敗しました: {e}")
+        st.warning(f"⚠️ 画像アップロード例外: {type(e).__name__}: {e}")
         return None
 
 
