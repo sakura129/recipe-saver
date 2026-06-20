@@ -306,6 +306,59 @@ def extract_from_text_with_claude(raw_text: str, image_url: str = "") -> dict:
 
 
 # ─────────────────────────────────────────────
+# 画像圧縮（Notionの5 MiB制限対応）
+# ─────────────────────────────────────────────
+def compress_image_if_needed(image_bytes: bytes, filename: str,
+                              max_bytes: int = 4_500_000) -> tuple[bytes, str]:
+    """
+    Notionの無料プランは5 MiB制限のため、超えている場合はJPEGに変換・縮小して返す。
+    4.5 MiBをターゲットにして余裕を持たせる。
+    """
+    if len(image_bytes) <= max_bytes:
+        return image_bytes, filename
+
+    try:
+        from PIL import Image  # type: ignore
+        import io
+
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # JPEG非対応モードをRGBに変換
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+
+        # まず最大1920pxにリサイズ
+        max_dim = 1920
+        w, h = img.size
+        if w > max_dim or h > max_dim:
+            ratio = min(max_dim / w, max_dim / h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+
+        # JPEG品質を下げながら4.5 MiB以内に収める
+        for quality in [85, 75, 65, 55, 45]:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            compressed = buf.getvalue()
+            if len(compressed) <= max_bytes:
+                return compressed, filename.rsplit(".", 1)[0] + ".jpg"
+
+        # それでも超える場合はさらに縮小
+        for scale in [0.75, 0.5]:
+            w2, h2 = img.size
+            img = img.resize((int(w2 * scale), int(h2 * scale)), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=65, optimize=True)
+            compressed = buf.getvalue()
+            if len(compressed) <= max_bytes:
+                return compressed, filename.rsplit(".", 1)[0] + ".jpg"
+
+        return compressed, filename.rsplit(".", 1)[0] + ".jpg"
+
+    except Exception:
+        return image_bytes, filename
+
+
+# ─────────────────────────────────────────────
 # Claude Vision API で画像（写真・スクショ）からレシピを抽出
 # ─────────────────────────────────────────────
 def _media_type(filename: str) -> str:
@@ -391,6 +444,9 @@ def upload_image_to_notion(image_bytes: bytes, filename: str = "image.jpg") -> s
       画像表示エラーが発生しない）
     失敗した場合は None を返す。
     """
+    # 5 MiB制限を超えていたら自動圧縮
+    image_bytes, filename = compress_image_if_needed(image_bytes, filename)
+
     ext = (filename.rsplit(".", 1)[-1] if "." in filename else "jpg").lower()
     ct = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
           "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
